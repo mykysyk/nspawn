@@ -1,0 +1,943 @@
+#http://fedoraproject.org/wiki/Features/SystemdLightweightContainers
+#http://kumar-pravin.blogspot.jp/2015/02/create-lightweight-containers-using.html
+#-----------------------------------------------------------
+# CONFIG
+#-----------------------------------------------------------
+VERSION=0.1.1
+
+LANG=C
+GLOBAL_MASTER_CONTAINER_DIR=/var/lib/machines
+GLOBAL_NSPAWN_CONTAINER_DIR=/var/lib/container
+GLOBAL_OVERLAY_CONTAINER_DIR=/var/lib/nspawn/overlay
+GLOBAL_OVERLAY_UPPER_DIR=overlay.upper
+GLOBAL_OVERLAY_WORK_DIR=overlay.work
+GLOBAL_OVERLAY_MOUNT_FILE=overlay.mount
+GLOBAL_CONTAINER_INFO_FILE=info
+. /etc/rc.d/init.d/functions
+
+#-----------------------------------------------------------
+# VERSION
+#-----------------------------------------------------------
+function container_version(){
+
+    echo "`basename $0` ${VERSION}"
+    echo
+}
+
+#-----------------------------------------------------------
+# USAGE
+#-----------------------------------------------------------
+function usage(){
+
+    container_version
+    echo "--- USAGE ---"
+    echo " $0 create    [centos5|centos6|centos7] [CONTAINER_NAME] [CONTAINER_PASSWORD]"
+    echo " $0 console   [CONTAINER_NAME] "
+    echo " $0 list"
+    echo " $0 master-list"
+    echo " $0 master_create  [centos5|centos6|centos7]"
+    echo " $0 start     [CONTAINER_NAME] "
+    echo " $0 autostart [CONTAINER_NAME] "
+    echo " $0 autostart --disable [CONTAINER_NAME] "
+    echo " $0 autostart --list"
+    echo " $0 shutdown  [CONTAINER_NAME] "
+    echo " $0 destroy   [CONTAINER_NAME] "
+    echo " $0 undefine  [CONTAINER_NAME] "
+    echo " $0 show      [CONTAINER_NAME] "
+    echo
+    echo "kernel version => 3.10.0-229.1.2.el7.x86_64"
+    exit 1
+}
+
+#-----------------------------------------------------------
+# MAIN
+#-----------------------------------------------------------
+function main(){
+
+    case $1 in
+        create)        shift ; container_create    ${@} ;;
+        console)       shift ; container_console   ${@} ;;
+        list)          shift ; container_list      ${@} ;;
+        start)         shift ; container_start     ${@} ;;
+        autostart)     shift ; container_autostart ${@} ;;
+        shutdown)      shift ; container_shutdown  ${@} ;;
+        destroy)       shift ; container_destroy   ${@} ;;
+        undefine)      shift ; container_undefine  ${@} ;;
+        show)          shift ; container_show      ${@} ;;
+        list-master)   shift ; master_list         ${@} ;;
+        create-master) shift ; master_create       ${@} ;;
+        --version|-V)   container_version ${@} ;;
+        *)         usage ;;
+    esac
+}
+
+#-----------------------------------------------------------
+# IS ALIVE
+#-----------------------------------------------------------
+function is_alive(){
+
+    local CONTAINER_NAME=$1
+
+    if [ -f /var/run/systemd/machines/${CONTAINER_NAME} ] 
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# HAS CONTAINER NAME
+#-----------------------------------------------------------
+function has_container_dir(){
+
+    local CONTAINER_NAME=$1
+    local INSTALL_DIR=${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}
+
+    if [ -z "${CONTAINER_NAME}" ]
+    then
+        return 1
+    fi
+
+    if [ -d ${INSTALL_DIR} ]
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# HAS MASTER IMAGE
+#-----------------------------------------------------------
+function has_master_image(){
+
+    local MASTER_IMAGE=${GLOBAL_MASTER_CONTAINER_DIR}/$1
+
+    if [ -d ${MASTER_IMAGE} ]
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# HAS OVERLAYFS
+#-----------------------------------------------------------
+function has_overlayfs_mod(){
+
+    if lsmod | grep -q overlay
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# HAS MOUNT
+#-----------------------------------------------------------
+function has_overlayfs_mount(){
+
+    local INSTALL_DIR=${GLOBAL_NSPAWN_CONTAINER_DIR}/$1
+
+    if egrep -q "^overlay ${INSTALL_DIR}" /proc/mounts
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# IS AUTOSTART
+#-----------------------------------------------------------
+function is_autostart(){
+
+    local CONTAINER_NAME=$1
+
+    if [ -f /etc/systemd/system/multi-user.target.wants/systemd-nspawn@${CONTAINER_NAME}.service ] 
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}
+#-----------------------------------------------------------
+# コンテナコンソールログイン
+#-----------------------------------------------------------
+function container_console(){
+
+    local CONTAINER_NAME=$1
+
+    if is_alive ${CONTAINER_NAME}
+    then
+        CONTAINER_PID=`awk -F= '/LEADER/{print $2}' /var/run/systemd/machines/${CONTAINER_NAME}`
+        nsenter --mount --uts --ipc --net --pid --target ${CONTAINER_PID}
+    else
+        $SETCOLOR_FAILURE
+        echo -e "\n[ERROR] machine ${CONTAINER_NAME} not found \n"
+        $SETCOLOR_NORMAL
+        machinectl -a
+        exit 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# コンテナ自動起動
+#-----------------------------------------------------------
+function container_autostart() {
+
+    echo -n "autostart: "
+    
+    case $1 in
+        --disable)
+            if ! has_container_dir $2
+            then
+                echo -n "$2 not found"; failure; echo; return 1
+            fi
+
+            if systemctl disable systemd-nspawn@$2.service >/dev/null 2>&1 
+            then
+                echo -n "disable"; success; echo; return 0
+            else
+                echo -n "disable"; failure; echo; return 1
+            fi
+            ;;
+        --list)
+            echo "list"
+            container_list
+            ;;
+        *)
+            if ! has_container_dir $1
+            then
+                echo -n "$1 not found"; failure; echo; return 1
+            fi
+
+            if systemctl enable systemd-nspawn@$1.service >/dev/null 2>&1
+            then
+                echo -n "enable"; success; echo; return 0
+            else
+                echo -n "enable"; failure; echo; return 0
+            fi
+            ;;
+    esac
+}
+
+#-----------------------------------------------------------
+# コンテナ起動
+#-----------------------------------------------------------
+function container_start() {
+
+    local CONTAINER_NAME=$1
+
+    echo -n "Starting ${CONTAINER_NAME}: "
+
+    #--- コンテナディレクトリ有無確認
+    if ! has_container_dir ${CONTAINER_NAME}
+    then
+        echo -n "Container directory not found."; failure; echo; exit 1
+    fi
+
+    #--- OverlayFS マウントされているかチェック
+    if ! has_overlayfs_mount ${CONTAINER_NAME}
+    then
+        if ! remount_overlayfs ${CONTAINER_NAME}
+        then
+            echo -n "OverlayFS remount."; failure; echo; exit 1
+        fi
+    #else
+        #echo -n "OverlayFS not mounted."; failure; echo; exit 1
+    fi
+
+    #--- start
+    if is_alive ${CONTAINER_NAME}
+    then
+        echo -n "Container directory not found."; passed; echo; exit 0
+    else
+        systemctl start  systemd-nspawn@${CONTAINER_NAME}.service >/dev/null 2>&1 && success || failure
+        echo
+    fi
+}
+
+#-----------------------------------------------------------
+# コンテナ停止(ゲストを丁寧にシャットダウン)
+#-----------------------------------------------------------
+function container_shutdown() {
+
+    local CONTAINER_NAME=$1
+
+    echo -n "Stopping ${CONTAINER_NAME}: "
+    if ! has_container_dir ${CONTAINER_NAME}
+    then
+        echo -n "container ${CONTAINER_NAME} not found"; failure; echo; exit 0
+    else
+        systemctl stop  systemd-nspawn@${CONTAINER_NAME}.service > /dev/null 2>&1
+        if is_alive ${CONTAINER_NAME}
+        then
+            failure; echo
+        else
+            success; echo
+        fi
+    fi
+
+}
+
+#-----------------------------------------------------------
+# コンテナ停止(ゲストを強制的に停止)
+#-----------------------------------------------------------
+function container_destroy() {
+
+    local CONTAINER_NAME=$1
+
+    echo -n "Stopping ${CONTAINER_NAME}: "
+    if ! has_container_dir ${CONTAINER_NAME}
+    then
+        echo -n "container ${CONTAINER_NAME} not found"; failure; echo; exit 0
+    else
+        if is_alive ${CONTAINER_NAME}
+        then
+            kill -9 `awk -F= '/LEADER/{print $2}' /var/run/systemd/machines/${CONTAINER_NAME}`
+        fi
+    fi
+
+    sleep 1
+
+    if is_alive ${CONTAINER_NAME}
+    then
+        failure; echo
+    else
+        success; echo
+    fi
+
+}
+
+#-----------------------------------------------------------
+# コンテナ削除
+#=-----------------------------------------------------------
+function container_undefine() {
+
+    local CONTAINER_NAME=$1
+
+    #--- check
+    if ! has_container_dir ${CONTAINER_NAME}
+    then
+        echo -n "check ontainer name: ${CONTAINER_NAME} is not defined"
+        failure && echo
+        exit 1
+    fi
+
+    read -p "Delete ${CONTAINER_NAME} ok ? [y/d/N]: > " VALUE
+
+    case $VALUE in
+        YES|yes|Y|y)
+            #--- stop
+            container_destroy ${CONTAINER_NAME}
+            container_autostart --disable ${CONTAINER_NAME}
+            unmount_overlayfs ${CONTAINER_NAME}
+            ;;
+        *)
+            passed
+            $SETCOLOR_FAILURE
+            echo "Exiting on user command"
+            $SETCOLOR_NORMAL
+            container_list
+            ;;
+    esac
+
+}
+
+#-----------------------------------------------------------
+# コンテナ一覧
+#-----------------------------------------------------------
+function container_list() {
+
+    echo "--- ALL CONTAINER ---"
+    for CONTAINER_NAME in `find ${GLOBAL_NSPAWN_CONTAINER_DIR} -maxdepth 1 -type d -exec basename {} \;`
+    do
+        if [ ${CONTAINER_NAME} != `basename ${GLOBAL_NSPAWN_CONTAINER_DIR}` ]
+        then
+            if is_alive ${CONTAINER_NAME}
+            then
+                $SETCOLOR_SUCCESS
+                echo -n " running  "
+                $SETCOLOR_NORMAL
+
+            else
+                $SETCOLOR_FAILURE
+                echo -n " stopping "
+                $SETCOLOR_NORMAL
+            fi
+
+            if is_autostart ${CONTAINER_NAME}
+            then
+                $SETCOLOR_SUCCESS
+                echo -n " autostart  "
+                $SETCOLOR_NORMAL
+            else
+                $SETCOLOR_FAILURE
+                echo -n " no start "
+                $SETCOLOR_NORMAL
+            fi
+                
+            echo "${CONTAINER_NAME}"
+        fi
+    done
+
+}
+
+#-----------------------------------------------------------
+# マスターコンテナ一覧
+#-----------------------------------------------------------
+function master_list() {
+
+    echo "--- ALL MASTER CONTAINER ---"
+    for CONTAINER_NAME in `find ${GLOBAL_MASTER_CONTAINER_DIR} -maxdepth 1 -type d -exec basename {} \;`
+    do
+        if [ ${CONTAINER_NAME} == `basename ${GLOBAL_MASTER_CONTAINER_DIR}` ]
+        then
+            continue
+        elif [ ${CONTAINER_NAME} == `basename ${GLOBAL_OVERLAY_CONTAINER_DIR}` ]
+        then
+            continue
+        else
+            echo "${CONTAINER_NAME}"
+        fi
+    done
+
+}
+#-----------------------------------------------------------
+# OVERLAYFS MOUNT 
+#-----------------------------------------------------------
+function mount_overlayfs(){
+
+    local CONTAINER_OS=$1
+    local CONTAINER_NAME=$2
+
+    local LOWER_DIR=${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}
+    local UPPER_DIR=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_UPPER_DIR}
+    local WORK_DIR=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_WORK_DIR}
+    local MERGE_DIR=${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}
+    local MOUNT_INFO=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_MOUNT_FILE}
+
+    mkdir -p ${UPPER_DIR}
+    mkdir -p ${WORK_DIR}
+    mkdir -p ${MERGE_DIR}
+
+    if mount -t overlay -o \
+        lowerdir=${LOWER_DIR},upperdir=${UPPER_DIR},workdir=${WORK_DIR} \
+        overlay ${MERGE_DIR} >/dev/null 2>&1
+    then
+        echo "if mount -t overlay -o lowerdir=${LOWER_DIR},upperdir=${UPPER_DIR},workdir=${WORK_DIR} overlay ${MERGE_DIR}" > ${MOUNT_INFO}
+        return 0
+    else
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# OVERLAYFS REMOUNT
+#-----------------------------------------------------------
+function remount_overlayfs() {
+
+    local CONTAINER_NAME=$1
+    local MOUNT_INFO=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_MOUNT_FILE}
+    
+    if bash ${MOUNT_INFO} > /dev/null 2>&1
+    then
+        return 0
+    else
+        return 1
+    fi
+
+}    
+
+#-----------------------------------------------------------
+# OVERLAYFS UMOUNT 
+#-----------------------------------------------------------
+function unmount_overlayfs(){
+
+    local CONTAINER_NAME=$1
+
+    echo -n "umount: overlayfs: ${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}"
+    umount ${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME} >/dev/null 2>&1 && success || failure
+    echo
+
+    echo -n "remove: ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_UPPER_DIR}"
+    rm -rf "${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_UPPER_DIR}" >/dev/null 2>&1 && success || failure
+    echo
+
+    echo -n "remove: ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_WORK_DIR}"
+    rm -rf "${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_WORK_DIR}" >/dev/null 2>&1 && success || failure
+    echo 
+
+    echo -n "remove: ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}"
+    rm -rf "${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}" >/dev/null 2>&1 && success || failure
+    echo
+
+    echo -n "remove: ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_MOUNT_FILE}"
+    rm -rf "${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_MOUNT_FILE}" >/dev/null 2>&1 && success || failure
+    echo
+
+    echo -n "remove: ${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}" 
+    rm -rf "${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}" >/dev/null 2>&1 && success || failure
+    echo
+
+}
+
+#-----------------------------------------------------------
+# コンテナ作成
+#-----------------------------------------------------------
+function container_create(){
+
+    local CONTAINER_OS=$1
+    local CONTAINER_NAME=$2
+    local CONTAINER_PASSWORD=$3
+
+    CONTAINER_PASSWORD=${CONTAINER_PASSWORD:='$xXxPASSWORDxXx$'}
+    #--- コマンドの引数チェック
+    echo -n "container create: "
+    if [ ${#} -le 1 ] 
+    then
+         echo -n "command failed"; failure; echo; exit 1
+    fi
+
+    #--- コンテナ名の重複チェック
+    if has_container_dir ${CONTAINER_NAME}
+    then
+        echo -n "${CONTAINER_NAME} already in use"; failure; echo; exit 1
+    fi
+
+    #--- コンテナマスターの有無チェック
+    if ! has_master_image ${CONTAINER_OS}
+    then
+        echo -n "${CONTAINER_OS} is not found."; failure; echo; exit 1
+    fi
+
+    #--- OverlayFS のカーネルモジュール有無確認 (必須: 3.10.0-229.1.2.el7.x86_64 以上)
+    if ! has_overlayfs_mod
+    then
+        echo -n "Module overlay not found."; failure; echo; exit 1
+    fi
+
+    #--- OverlayFS で コンテナマスターを lowdirとしてマウントする
+    if ! mount_overlayfs ${CONTAINER_OS} ${CONTAINER_NAME} 
+    then
+        echo -n "overlay not mounted."; failure; echo; exit 1
+    fi
+
+    #--- systemctl コマンドで起動できるようにサービスを作成する
+    if create_container_service ${CONTAINER_NAME}
+    then
+        echo -n "error /etc/systemd/system/systemd-nspawn@.service"; failure; echo; exit 1
+    fi
+
+    #--- CREATE MESSAGE
+    create_container_readme ${CONTAINER_NAME}
+
+    #--- OverlayFS でマウントした コンテナイメージ のrootパスワード変更
+    if ! set_container_root_passwd ${CONTAINER_NAME} ${CONTAINER_PASSWORD}
+    then
+        echo -n "set password error"; failure; echo; exit 1
+    fi
+
+    #--- 起動
+    if ! systemctl start  systemd-nspawn@${CONTAINER_NAME}.service >/dev/null 2>&1
+    then
+        echo -n "systemctl start error"; failure; echo; exit 1
+    fi
+
+    success; echo
+    
+    #---
+    ${SETCOLOR_SUCCESS}
+    echo "README : ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}"
+    ${SETCOLOR_NORMAL}
+
+}
+
+#-----------------------------------------------------------
+# マスターコンテナ作成
+#-----------------------------------------------------------
+function master_create(){
+
+    local CONTAINER_OS=$1
+
+    #--- コンテナマスターの有無チェック
+    echo -n "check master image: "
+    if has_master_image ${CONTAINER_OS}
+    then
+        echo "master image alrady in use ${CONTAINER_OS}"; failure; echo 
+    else
+        #--- コンテナマスターがない場合作成する
+        case ${CONTAINER_OS} in
+            centos5) echo -n "create ${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}"; passed; echo 
+                     create_container_centos5 ${CONTAINER_OS} ;;
+            centos6) echo -n "create ${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}": passed; echo
+                     create_container_centos6 ${CONTAINER_OS} ;;
+            centos7) echo -n "create ${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}"; passed; echo
+                     create_container_centos7 ${CONTAINER_OS} ;;
+                  *) echo -n "os type $CONTAINER_OS is not define"; failure; echo; exit 1 ;;
+        esac
+    fi
+
+}
+
+#-----------------------------------------------------------
+# コンテナログイン(root)パスワード設定
+#-----------------------------------------------------------
+function set_container_root_passwd(){
+
+    local INSTALL_DIR=${GLOBAL_NSPAWN_CONTAINER_DIR}/$1
+    local CONTAINER_PASSWORD=$2
+
+    if ! chroot ${INSTALL_DIR} pwconv > /dev/null 2>&1
+    then
+        echo -n "pwconv"
+        return 1
+    fi
+
+    if echo ${CONTAINER_PASSWORD} | chroot ${INSTALL_DIR} passwd --stdin root > /dev/null 2>&1 
+    then
+        echo -n "$CONTAINER_PASSWORD "
+        return 0
+    else
+        echo -n "$CONTAINER_PASSWORD "
+        return 1
+    fi
+
+}
+
+#-----------------------------------------------------------
+# マスタコンテナ作成(CentOS7)
+#-----------------------------------------------------------
+function create_container_centos7(){
+
+    local CONTAINER_OS=$1
+    local INSTALL_DIR=${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}
+
+    # DISABLE SELINUX
+    setenforce 0 > /dev/null
+
+    #--- install
+    echo -n "create centos7 master: ${INSTALL_DIR}"
+    mkdir -p ${INSTALL_DIR}
+    yum \
+        install -y \
+        --releasever=7 \
+        --installroot=${INSTALL_DIR} \
+        systemd passwd yum centos-release vim-minimal \
+        psmisc rootfiles hostname bash-completion > /dev/null 2>&1 && success || failure
+    echo
+
+    #--- yum update
+    echo -n "create centos7 master: yum update"
+    chroot ${INSTALL_DIR} yum -y update > /dev/null 2>&1 && success || failure
+    echo 
+
+}
+
+#-----------------------------------------------------------
+# マスタコンテナ作成(CentOS6)
+#-----------------------------------------------------------
+function create_container_centos6(){
+
+    local CONTAINER_OS=$1
+    local INSTALL_DIR=${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}
+
+    # DISABLE SELINUX
+    setenforce 0 > /dev/null
+
+    #--- centos-release.rpm
+    echo -n "create centos6 master: download centos-release 6"
+    mkdir -p ${INSTALL_DIR}/tmp
+    yum \
+        install -y \
+        --nogpgcheck \
+        --releasever=6 \
+        --installroot=${INSTALL_DIR} \
+        --downloadonly \
+        --downloaddir=${INSTALL_DIR}/tmp \
+        centos-release > /dev/null 2>&1 && success || failure
+    echo
+
+    #--- install
+    echo -n "create centos6 master: ${INSTALL_DIR}"
+    yum \
+        install -y \
+        --nogpgcheck \
+        --releasever=6 \
+        --installroot=${INSTALL_DIR} \
+        passwd yum centos-release vim-minimal\
+        psmisc rootfiles hostname \
+        plymouth libselinux-python > /dev/null 2>&1 && success || failure
+    echo
+
+
+    #--- rc.sysinit
+    chroot ${INSTALL_DIR} sed -i 's/^\(\/sbin\/start_udev\)/#\1/' /etc/rc.d/rc.sysinit
+
+    #--- halt
+    chroot ${INSTALL_DIR} sed -i '115,126s/^/#/' /etc/rc.d/init.d/halt
+
+    #--- remove tty
+    chroot ${INSTALL_DIR} rm -f /etc/init/start-ttys.conf
+    chroot ${INSTALL_DIR} rm -f /etc/init/tty.conf
+
+    #--- agetty.conf
+    echo "start on stopped rc RUNLEVEL=[2345]" >  ${INSTALL_DIR}/etc/init/agetty.conf
+    echo "stop on runlevel [!2345]"            >> ${INSTALL_DIR}/etc/init/agetty.conf
+    echo "respawn"                             >> ${INSTALL_DIR}/etc/init/agetty.conf
+    echo "exec /sbin/agetty console 38400"     >> ${INSTALL_DIR}/etc/init/agetty.conf
+
+    #--- fstab
+    echo "/dev/root / rootfs defaults 0 0"       >  ${INSTALL_DIR}/etc/fstab
+    echo "tmpfs /dev/shm tmpfs nosuid,nodev 0 0" >> ${INSTALL_DIR}/etc/fstab
+
+    #--- mtab
+    chroot ${INSTALL_DIR} cp /etc/fstab /etc/mtab
+
+    #--- resolv.conf
+    cp /etc/resolv.conf ${INSTALL_DIR}/etc/resolv.conf
+
+    #--- chkconfig
+    for SERVICE in `chroot ${INSTALL_DIR} chkconfig --list|cut -f1`
+    do
+        chroot ${INSTALL_DIR} chkconfig ${SERVICE} off
+    done
+
+    #--- yum
+    # https://access.redhat.com/ja/node/395763
+    chroot ${INSTALL_DIR} rm -f  /var/lib/rpm/*
+    chroot ${INSTALL_DIR} rm -rf /var/cache/yum
+    chroot ${INSTALL_DIR} rpm --initdb
+    chroot ${INSTALL_DIR} mknod -m 644 /dev/urandom c 1 9
+    echo -n "create centos6 master: reinstall centos-release 6"
+    chroot ${INSTALL_DIR} rpm -ivh /tmp/centos-release*.rpm --nodeps > /dev/null 2>&1 && success || failure
+    echo
+    chroot ${INSTALL_DIR} rm -f    /tmp/*.rpm
+    chroot ${INSTALL_DIR} ln -sf   /etc/centos-release /etc/os-release
+    echo -n "create centos6 master: yum update"
+    chroot ${INSTALL_DIR} yum -y update > /dev/null 2>&1 && success || failure
+    echo 
+
+}
+
+#-----------------------------------------------------------
+# マスタコンテナ作成(CentOS5)
+#-----------------------------------------------------------
+function create_container_centos5(){
+
+    local CONTAINER_OS=$1
+    local INSTALL_DIR=${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}
+
+    # DISABLE SELINUX
+    setenforce 0 > /dev/null
+
+
+    #--- centos-release.rpm
+    echo -n "create centos5 master: download centos-release 5"
+    mkdir -p ${INSTALL_DIR}/tmp
+    yum \
+        install -y \
+        --nogpgcheck \
+        --releasever=5 \
+        --installroot=${INSTALL_DIR} \
+        --downloadonly \
+        --downloaddir=${INSTALL_DIR}/tmp \
+        centos-release  > /dev/null 2>&1 && success || failure
+    echo
+
+    #--- install
+    echo -n "create centos5 master: ${INSTALL_DIR}"
+    yum \
+        install -y \
+        --nogpgcheck \
+        --releasever=5 \
+        --installroot=${INSTALL_DIR} \
+        passwd yum centos-release vim-minimal\
+        psmisc rootfiles hostname curl > /dev/null 2>&1 && success || failure
+    echo
+
+    #--- rc.sysinit
+    chroot ${INSTALL_DIR} sed -i 's/^\(\/sbin\/start_udev\)/#\1/' /etc/rc.d/rc.sysinit
+
+    #--- halt
+    chroot ${INSTALL_DIR} sed -i '140,151s/^/#/' /etc/rc.d/init.d/halt
+
+    #--- inittab
+    chroot ${INSTALL_DIR} sed -i 's/^\([0-9]\)/#\1/' /etc/inittab
+    chroot ${INSTALL_DIR} sed -i '$s/$/\n1:2345:respawn:\/sbin\/agetty 38400 console/' /etc/inittab
+
+    #--- fstab
+    echo "/dev/root / rootfs defaults 0 0"       >  ${INSTALL_DIR}/etc/fstab
+    echo "tmpfs /dev/shm tmpfs nosuid,nodev 0 0" >> ${INSTALL_DIR}/etc/fstab
+
+    #--- mtab
+    chroot ${INSTALL_DIR} cp /etc/fstab /etc/mtab
+
+    #--- resolv.conf
+    cp /etc/resolv.conf ${INSTALL_DIR}/etc/resolv.conf
+
+    #--- chkconfig
+    for SERVICE in `chroot ${INSTALL_DIR} chkconfig --list|cut -f1`
+    do
+        chroot ${INSTALL_DIR} chkconfig ${SERVICE} off
+    done
+
+    #--- yum
+    # https://access.redhat.com/ja/node/395763
+    chroot ${INSTALL_DIR} rm -f  /var/lib/rpm/*
+    chroot ${INSTALL_DIR} rm -rf /var/cache/yum
+    chroot ${INSTALL_DIR} rpm --initdb
+    chroot ${INSTALL_DIR} mknod -m 644 /dev/urandom c 1 9
+    echo -n "create centos5 master: reinstall centos-release 5"
+    chroot ${INSTALL_DIR} rpm -ivh /tmp/centos-release*.rpm --nodeps > /dev/null 2>&1 && success || failure
+    echo
+    chroot ${INSTALL_DIR} rm -f    /tmp/*.rpm
+    chroot ${INSTALL_DIR} ln -sf   /etc/centos-release /etc/os-release
+    echo -n "create centos6 master: yum update"
+    chroot ${INSTALL_DIR} yum -y update  > /dev/null 2>&1 && success || failure
+    echo
+
+}
+
+#-----------------------------------------------------------
+# CREATE SERVICE
+#-----------------------------------------------------------
+function create_container_service(){
+
+    if [ ! -f /etc/systemd/system/systemd-nspawn@.service ]
+    then
+        cp /usr/lib/systemd/system/systemd-nspawn@.service /etc/systemd/system/
+        sed -i 's/-bjD/-bD/' /etc/systemd/system/systemd-nspawn@.service
+        return 0
+    else
+        return 1
+    fi
+}
+
+#-----------------------------------------------------------
+# CREATE MESSAGE
+#-----------------------------------------------------------
+function create_container_readme(){
+
+    local CONTAINER_NAME=$1
+    local LOG_PATH=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}
+    local LOWER_DIR=${GLOBAL_MASTER_CONTAINER_DIR}/${CONTAINER_OS}
+    local UPPER_DIR=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_UPPER_DIR}
+    local WORK_DIR=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_WORK_DIR}
+    local MERGE_DIR=${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}
+
+    cat <<EOS> ${LOG_PATH}
+        # ${LOG_PATH}
+        # this file was generated by $0
+        #-----------------------------------------------------------
+        # Start a container as a system service
+        #-----------------------------------------------------------
+        
+        `basename $0` start ${CONTAINER_NAME}
+
+            systemctl start  systemd-nspawn@${CONTAINER_NAME}.service
+
+        #-----------------------------------------------------------
+        # Open an interactive terminal login session to a container
+        #-----------------------------------------------------------
+
+        `basename $0` console ${CONTAINER_NAME}
+
+            CONTAINER_PID=\`awk -F= '/LEADER/{print \$2}' /var/run/systemd/machines/${CONTAINER_NAME}\`
+            nsenter --mount --uts --ipc --net --pid --target \$CONTAINER_PID
+
+        #-----------------------------------------------------------
+        # Power off a container
+        #-----------------------------------------------------------
+
+        `basename $0` shutdown ${CONTAINER_NAME}
+
+            systemctl stop systemd-nspawn@${CONTAINER_NAME}.service
+        
+        #-----------------------------------------------------------
+        # Without cleanly shutting it down
+        #-----------------------------------------------------------
+
+        `basename $0` destroy ${CONTAINER_NAME}
+
+            kill -9 \`awk -F= '/LEADER/{print \$2}' /var/run/systemd/machines/${CONTAINER_NAME}\`
+
+        #-----------------------------------------------------------
+        # 
+        #-----------------------------------------------------------
+
+        `basename $0` undefine ${CONTAINER_NAME}
+
+            kill -9 \`awk -F= '/LEADER/{print \$2}' /var/run/systemd/machines/${CONTAINER_NAME}\`
+            systemctl disable systemd-nspawn@${CONTAINER_NAME}.service
+            umount ${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}
+            rm -rf ${GLOBAL_NSPAWN_CONTAINER_DIR}/${CONTAINER_NAME}
+            rm -rf ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_UPPER_DIR}
+            rm -rf ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_WORK_DIR}
+            rm -rf ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}
+            rm -rf ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_OVERLAY_MOUNT_FILE}
+
+        #-----------------------------------------------------------
+        # List containers
+        #-----------------------------------------------------------
+
+        `basename $0` list
+
+            machinectl -a
+            ls -l ${GLOBAL_NSPAWN_CONTAINER_DIR}
+
+        #-----------------------------------------------------------
+        # Show properties 
+        #-----------------------------------------------------------
+
+        `basename $0` show ${CONTAINER_NAME}
+
+            machinectl status ${CONTAINER_NAME}
+            machinectl show   ${CONTAINER_NAME}
+            cat ${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}
+
+        #-----------------------------------------------------------
+        # Create container
+        #-----------------------------------------------------------
+        `basename $0` create ${CONTAINER_NAME}
+
+            mkdir -p ${UPPER_DIR}
+            mkdir -p ${WORK_DIR}
+            mkdir -p ${MERGE_DIR}
+            mount -t overlay -o \\
+            lowerdir=${LOWER_DIR},upperdir=${UPPER_DIR},workdir=${WORK_DIR} \\
+            overlay ${MERGE_DIR}
+            systemctl start  systemd-nspawn@${CONTAINER_NAME}.service
+
+EOS
+    sed -i 's/^        //g' ${LOG_PATH}
+
+}
+
+#-----------------------------------------------------------
+# CREATE MESSAGE
+#-----------------------------------------------------------
+function container_show(){
+
+    local CONTAINER_NAME=$1
+    local LOG_PATH=${GLOBAL_OVERLAY_CONTAINER_DIR}/${CONTAINER_NAME}.${GLOBAL_CONTAINER_INFO_FILE}
+
+    SHOW=$(machinectl show ${CONTAINER_NAME} 2>/dev/null)
+    STATUS=$(machinectl status ${CONTAINER_NAME} 2>/dev/null)
+    echo -e "${SHOW}\n\n${STATUS}\n\n$(cat ${LOG_PATH})" | more
+    
+}
+#
+main ${@}
